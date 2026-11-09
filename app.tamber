@@ -1,0 +1,10 @@
+tamber beerbook
+
+theme
+  paper = light-dark(#f5ecd9, #1c1712)
+  paper.card = light-dark(#fffaf0, #2a2219)
+  ink = light-dark(#3a2816, #f2e6d0)
+  ink.soft = light-dark(#806548, #b8a184)
+  amber = light-dark(#c9780f, #f0a83a)
+  shadow = light-dark(#5a3a1a40, #00000099)
+  sticker.edge = #ffffff  scheme=fixed

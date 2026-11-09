@@ -1,0 +1,226 @@
+test "a new album is empty, and so is the year"
+  clock data
+  expect tree has "empty-add"
+  tap "tab-year"
+  clock data
+  expect tree has "year-add"
+
+test "a beer is photographed, described and stuck in the album"
+  epoch "2026-03-14T19:30:00Z"
+  clock data
+  tap "add-beer"
+  pick "photo" "fixtures/pint.jpg"
+  clock +400
+  clock settle
+  expect tree has "add-preview"
+  expect disabled "add-save"
+  expect text "add-hint" == "Name the beer to save it."
+  type "add-name" "Pilsner Urquell"
+  type "add-brewery" "Plzeňský Prazdroj"
+  type "add-style" "Pilsner"
+  tap "add-glass"
+  tap "add-rating-4"
+  type "add-location" "Prague"
+  expect enabled "add-save"
+  tap "add-save"
+  clock data
+  clock settle
+  expect text "album-count" == "1 sticker"
+  expect text "sticker-name-1" == "Pilsner Urquell"
+  expect tree has "sticker-stars-1"
+  expect state beers.0 .style == "Pilsner"
+  expect state beers.0 .container == "Glass"
+  expect state beers.0 .rating == 4
+  expect state beers.0 .day == "2026-03-14"
+
+test "a sticker's page shows it, rerates it, and peels it off"
+  epoch "2026-03-14T19:30:00Z"
+  clock data
+  tap "add-beer"
+  pick "photo" "fixtures/can.jpg"
+  clock +400
+  clock settle
+  type "add-name" "Hazy Jane"
+  type "add-brewery" "BrewDog"
+  type "add-style" "IPA"
+  tap "add-can"
+  tap "add-save"
+  clock data
+  clock settle
+  tap "sticker-1"
+  clock settle
+  expect text "detail-title" == "Hazy Jane"
+  expect text "detail-brewery" == "BrewDog"
+  expect text "detail-style" == "IPA"
+  expect text "detail-container" == "Can"
+  expect text "detail-location" == "—"
+  expect text "detail-when" == "Mar 14, 2026"
+  tap "detail-rating-5"
+  clock data
+  expect state beers.0 .rating == 5
+  tap "delete-beer"
+  tap "remove-confirm"
+  clock data
+  clock settle
+  expect tree missing "sticker-1"
+  expect tree has "empty-add"
+
+test "the album filters by style and keeps its order across launches"
+  clock data
+  tap "add-beer"
+  pick "photo" "fixtures/pint.jpg"
+  clock +400
+  clock settle
+  type "add-name" "Augustiner Helles"
+  type "add-style" "Lager"
+  tap "add-save"
+  clock data
+  clock settle
+  tap "add-beer"
+  pick "photo" "fixtures/bottle.jpg"
+  clock +400
+  clock settle
+  type "add-name" "Guinness"
+  type "add-style" "Stout"
+  tap "add-bottle"
+  tap "add-rating-3"
+  tap "add-save"
+  clock data
+  clock settle
+  expect text "album-count" == "2 stickers"
+  type "filter-style" "Stout"
+  expect text "album-count" == "1 sticker"
+  expect tree has "sticker-2"
+  expect tree missing "sticker-1"
+  type "filter-style" "Sour"
+  expect text "album-count" == "0 stickers"
+  expect tree has "album-none"
+  type "filter-style" ""
+  type "order" "best"
+  expect state order == "best"
+  reload
+  clock data
+  expect state order == "best"
+  expect text "album-count" == "2 stickers"
+
+test "the year in review counts the year's beers"
+  epoch "2026-03-14T19:30:00Z"
+  clock data
+  tap "add-beer"
+  pick "photo" "fixtures/pint.jpg"
+  clock +400
+  clock settle
+  type "add-name" "Pilsner Urquell"
+  type "add-brewery" "Plzeňský Prazdroj"
+  type "add-style" "Pilsner"
+  tap "add-rating-4"
+  type "add-location" "Prague"
+  tap "add-save"
+  clock data
+  clock settle
+  tap "add-beer"
+  pick "photo" "fixtures/bottle.jpg"
+  clock +400
+  clock settle
+  type "add-name" "Guinness"
+  type "add-style" "Stout"
+  tap "add-bottle"
+  tap "add-rating-5"
+  type "add-location" "Prague"
+  tap "add-save"
+  clock data
+  clock settle
+  tap "tab-year"
+  clock data
+  expect text "year-total" == "2"
+  expect text "year-days" == "on 1 day"
+  expect text "year-busiest" == "Mar"
+  expect text "year-average" == "4.5 ★"
+  expect text "year-first" == "Pilsner Urquell"
+  expect tree has "favourite-2"
+  expect tree has "year-places"
+
+test "the calendar puts each beer's sticker on its day, and the day lists them"
+  epoch "2026-03-14T19:30:00Z"
+  clock data
+  tap "add-beer"
+  pick "photo" "fixtures/pint.jpg"
+  clock +400
+  clock settle
+  type "add-name" "Pilsner Urquell"
+  tap "add-rating-4"
+  tap "add-save"
+  clock data
+  clock settle
+  tap "add-beer"
+  pick "photo" "fixtures/can.jpg"
+  clock +400
+  clock settle
+  type "add-name" "Hazy Jane"
+  type "add-brewery" "BrewDog"
+  type "add-style" "IPA"
+  tap "add-can"
+  tap "add-save"
+  clock data
+  clock settle
+  tap "tab-calendar"
+  clock data
+  expect text "cal-month" == "March 2026"
+  expect text "cal-summary" == "2 beers on 1 day"
+  expect text "day-count-2026-03-14" == "2"
+  expect tree missing "day-count-2026-03-13"
+  clock settle
+  tap "day-2026-03-14"
+  clock data
+  clock settle
+  expect text "day-title" == "Mar 14, 2026"
+  expect text "day-count" == "2 beers"
+  expect tree has "day-beer-1"
+  expect tree has "day-beer-2"
+  tap "day-beer-2"
+  clock settle
+  expect text "detail-title" == "Hazy Jane"
+
+test "the calendar turns its months and comes back to today's"
+  epoch "2026-03-14T19:30:00Z"
+  clock data
+  tap "tab-calendar"
+  clock data
+  expect text "cal-month" == "March 2026"
+  expect tree has "cal-add"
+  expect tree missing "cal-today"
+  tap "cal-prev"
+  tap "cal-prev"
+  tap "cal-prev"
+  clock data
+  expect text "cal-month" == "December 2025"
+  tap "cal-next"
+  clock data
+  expect text "cal-month" == "January 2026"
+  tap "cal-today"
+  clock data
+  expect text "cal-month" == "March 2026"
+
+test "a long press on the calendar's month loads the demo beers and takes them out again"
+  epoch "2026-11-09T19:30:00Z"
+  clock data
+  tap "tab-calendar"
+  clock data
+  expect tree has "cal-add"
+  tap "cal-month" contextmenu
+  tap "demo-load"
+  clock data
+  clock settle
+  expect text "cal-month" == "November 2026"
+  expect text "cal-summary" == "9 beers on 7 days"
+  tap "tab-album"
+  clock data
+  expect text "album-count" == "41 stickers"
+  tap "tab-calendar"
+  tap "cal-month" contextmenu
+  tap "demo-clear"
+  clock data
+  clock settle
+  expect tree has "cal-add"
+  tap "tab-album"
+  expect tree has "empty-add"

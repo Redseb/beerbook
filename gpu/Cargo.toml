@@ -1,0 +1,25 @@
+# Beer Book's GPU module: the beer behind each page, one fragment shader. The
+# presenter loads it on demand: a dylib natively (Metal), a wasm on the web (WebGPU).
+[package]
+name = "beerbook-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Beer Book's GPU module: the beer surface"
+publish = false
+build = "build.rs"
+
+[lib]
+name = "beerbook_gpu"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+exact-gpu = { path = "../../exact/gpu" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }
+
+[build-dependencies]
+exact-gpu-reflect = { path = "../../exact/gpu/reflect" }

@@ -1,0 +1,781 @@
+// Beer Book: every beer you drink, kept as a die-cut sticker in an album, and a
+// Year in Review. Two tabs, each its own stack: the album pushes a sticker's page
+// and presents the Add sheet; the year is one scrapbook page. The data is app.ts's,
+// on the device only. The palette is app.tamber's: paper, ink, amber, and the
+// sticker's white edge, which stays white in the dark.
+use EmptyState from "exact:content"
+
+routes nav
+  tab album "/"
+    beer "/beer/:id"
+    add "/add"
+  tab calendar "/calendar"
+    day "/day/:id"
+  tab year "/year"
+
+shape Beer
+  id: string
+  name: string
+  brewery: string
+  style: string
+  container: string
+  rating: number
+  location: string
+  photo: string
+  drunkAt: number
+  day: string
+  // The cut-out PNG (subject, white edge, shadow), or "" where there is none: the framed photo stands in.
+  sticker: string
+
+// A picked photo's subject, cut out by the Swift module; `ok` false on the web or with no clear subject.
+shape Cut
+  ok: bool
+  path: string
+  error: string
+
+shape YearCount
+  year: number
+  count: number
+
+shape MonthCount
+  month: number
+  label: string
+  count: number
+  // Of the busiest month's count, 0 to 1.
+  fraction: number
+
+shape Tally
+  name: string
+  count: number
+  // Of the largest count in its list, 0 to 1.
+  fraction: number
+
+shape Review
+  year: number
+  total: number
+  days: number
+  rated: number
+  average: number
+  months: MonthCount[]
+  busiest: string
+  styles: Tally[]
+  breweries: Tally[]
+  places: Tally[]
+  containers: Tally[]
+  favourites: Beer[]
+  first: string
+
+shape Reply
+  ok: bool
+  error: string
+
+shape Time
+  epochAtZero: number
+  utcOffset: number
+
+shape Media
+  prefersReducedMotion: bool
+  prefersColorScheme: string
+
+// One square of the calendar: a day of the month, or padding before the 1st and after the
+// last (`date` 0). A day's sticker is its best-rated beer's.
+shape DayCell
+  key: string
+  date: number
+  count: number
+  name: string
+  photo: string
+  sticker: string
+  today: bool
+  future: bool
+
+shape Month
+  label: string
+  total: number
+  days: number
+  cells: DayCell[]
+
+fn styles(): string[] = ["Lager", "Pilsner", "IPA", "Pale Ale", "Wheat", "Stout", "Porter", "Sour", "Saison", "Amber", "Other"]
+// A sticker's tilt, -4° to 4°, fixed by its place so the album doesn't shuffle as it redraws.
+fn tilt(i: number): number = ((i * 37) % 9) - 4
+fn countText(n: number, one: string, many: string): string = `${n} ${n == 1 ? one : many}`
+fn yearOf(b: Beer): number = match parseNumber(b.day.slice(0, 4)) { case some(y) => y, case none => 0 }
+fn found(beers: Beer[], id: string): bool = beers.filter(b => b.id == id).length > 0
+fn nameOf(beers: Beer[], id: string): string = match first(beers.filter(b => b.id == id)) { case some(b) => b.name, case none => "" }
+// A day key's heading, from the first beer drunk that day (the key itself when there is none).
+fn dayTitle(beers: Beer[], key: string, offset: number): string = match first(beers.filter(b => b.day == key)) { case some(b) => formatDate(b.drunkAt, offset, "medium"), case none => key }
+fn weekdays(): string[] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+// A calendar square's fizz and the squares' pour: translates and opacities, which the
+// compositor plays (the pages' beer is the GPU module's shader, below).
+keyframes swell
+  50% translate="0px 5px"
+keyframes fizz
+  from translate="0px 0px" opacity=0
+  20% opacity=0.95
+  to translate="2px -34px" opacity=0
+keyframes pourIn
+  from translate="0px 40px" opacity=0
+
+// The beer at a page's foot: the GPU module's `brew` shader (gpu/shaders/brew.wgsl),
+// Metal on Apple and WebGPU on the web, drawn behind what follows it and run on past
+// the home indicator. Its inputs: the surface's level (0 to 1 from its foot), dark,
+// still (Reduce Motion: one frame) and whether it sits on a card. A surface is named by its
+// shader's file, so every canvas is `brew`.
+
+component App
+  resource time = exactTime() as shape Time
+  resource beers = beers() as shape Beer[] else empty()
+  resource years = years() as shape YearCount[] else empty()
+  state pickedYear = 0
+  derive thisYear = match parseNumber(formatDate(time.epochAtZero, time.utcOffset, "iso").slice(0, 4)) { case some(y) => y, case none => 2026 }
+  derive year = pickedYear == 0 ? thisYear : pickedYear
+  resource review = review(year) as shape Review else empty()
+  resource media = exactViewport() as shape Media
+  derive still = media.prefersReducedMotion
+  derive dark = media.prefersColorScheme == "dark"
+
+  // The calendar: the month `monthShift` months from today's.
+  derive today = formatDate(time.epochAtZero, time.utcOffset, "iso")
+  state monthShift = 0
+  resource month = calendar(today, monthShift) as shape Month else empty()
+
+  // The album's filter and order, kept across launches.
+  state styleFilter = "" persist
+  state order = "newest" persist
+
+  // The Add sheet's draft.
+  state draftPhoto = ""
+  state draftName = ""
+  state draftBrewery = ""
+  state draftStyle = "Lager"
+  state draftContainer = "Glass"
+  state draftRating = 0
+  state draftLocation = ""
+  state refusal = ""
+  // The sticker the detail's Delete asks about.
+  state aimed = ""
+  // A photo is picked and the Add sheet waits for the picker to leave (see presentAdd).
+  state opening = false
+
+  mutation added as shape Reply refreshes beers, years, review, month then afterSave
+  mutation changed as shape Reply queue refreshes beers, review, month
+  mutation removed as shape Reply refreshes beers, years, review, month
+  mutation cut as shape Cut
+  // The hidden demo mode's: a year of beers in, or out again.
+  mutation demo as shape Reply refreshes beers, years, review, month
+
+  derive filtered = beers.filter(b => styleFilter == "" or b.style == styleFilter)
+  derive newest = sortBy(filtered, b => b.drunkAt, "desc")
+  derive shown = order == "oldest" ? sortBy(filtered, b => b.drunkAt) : order == "best" ? sortBy(newest, b => b.rating, "desc") : newest
+  derive saveError = match added { case some(r) => r.error, case none => "" }
+  derive draftCut = pending(cut) ? "" : match cut { case some(c) => c.ok ? c.path : "", case none => "" }
+  derive saveHint = pending(cut) ? "Cutting out your beer…" : pending(added) ? "Saving…" : draftName.trim() == "" ? "Name the beer to save it." : ""
+  derive yearChoices = years.map(y => y.year).includes(thisYear) ? years.map(y => y.year) : [thisYear].concat(years.map(y => y.year))
+
+  action pickTab(name: string)
+    nav = select(nav, name)
+  action follow(url: string)
+    nav = go(nav, url)
+  action back
+    nav = back(nav)
+  action reload
+    refresh beers
+
+  // Add: the photo first (the platform's picker), then the sheet for the rest.
+  action snap
+    showPicker("photo")
+  action photoPicked(files: Picked[])
+    match files.at(0)
+      case some(f)
+        draftPhoto = f.path
+        refusal = ""
+        send cut = cutSticker(f.path)
+        if top(nav).name != "add"
+          draftName = ""
+          draftBrewery = ""
+          draftStyle = "Lager"
+          draftContainer = "Glass"
+          draftRating = 0
+          draftLocation = ""
+          opening = true
+      case none
+        draftPhoto = draftPhoto
+  // The sheet opens once the picker has gone: on macOS the open panel is a sheet that is
+  // still attached when it hands over the photo, and a sheet presented then attaches to the
+  // panel and leaves with it, unseen.
+  task presentLater when opening
+    after(400, presentAdd)
+  action presentAdd
+    opening = false
+    nav = push(nav, "/add")
+  action editName(v: string)
+    draftName = v
+  action editBrewery(v: string)
+    draftBrewery = v
+  action editStyle(v: string)
+    draftStyle = v
+  action editContainer(v: string)
+    draftContainer = v
+  action editRating(n: number)
+    draftRating = draftRating == n ? 0 : n
+  action editLocation(v: string)
+    draftLocation = v
+  action save
+    if draftName.trim() != "" and draftPhoto != "" and not pending(added) and not pending(cut)
+      let at = time.epochAtZero + performanceNow()
+      send added = addBeer(draftPhoto, draftCut, draftName, draftBrewery, draftStyle, draftContainer, draftRating, draftLocation, at, formatDate(at, time.utcOffset, "iso"))
+  // The sheet closes only on an ok reply; a refusal keeps it open, saying why.
+  action afterSave
+    refusal = saveError
+    if saveError == "" and top(nav).name == "add"
+      nav = back(nav)
+      haptic("success")
+
+  action filterStyle(v: string)
+    styleFilter = v
+  action sortBy_(v: string)
+    order = v
+  action rate(id: string, n: number)
+    send changed = rateBeer(id, n)
+  action askRemove(id: string)
+    aimed = id
+    showModal("remove")
+  action remove(id: string)
+    send removed = removeBeer(id)
+    if top(nav).name == "beer"
+      nav = back(nav)
+  // The demo mode hides behind a long press (a right-click) on the calendar's month.
+  action askDemo
+    showModal("demo")
+  action loadDemo_
+    send demo = loadDemo(today, time.utcOffset)
+    monthShift = 0
+    haptic("success")
+  action clearDemo_
+    send demo = clearDemo()
+  action shiftMonth(by: number)
+    monthShift = monthShift + by
+    haptic("selection")
+  action thisMonth
+    monthShift = 0
+  action pickYear(v: string)
+    pickedYear = match parseNumber(v) { case some(y) => y, case none => 0 }
+
+  view
+    main navigationKey=`${top(nav).id}` navigationBack="back" navigate=follow testId="app"
+      width="100%" height="100%" display="flex" flex-direction="column" accent-color="amber" viewport-fit="cover"
+      // Before the tablist, which stays the root's last child (a Mac sidebar). The platform's photo picker; the picked copy goes to the Add sheet.
+      input type="file" accept="image/*" id="photo" display="none" change=photoPicked testId="photo"
+      dialog id="demo" role="alertdialog" aria-label="Demo Mode"
+        text "Fill the album with a year of demo beers, or take them out again. Beers you added stay."
+        button press=loadDemo_ commandfor="demo" command="close" testId="demo-load"
+          text "Load Demo Beers"
+        button press=clearDemo_ destructive=true commandfor="demo" command="close" testId="demo-clear"
+          text "Remove Demo Beers"
+        button commandfor="demo" command="close" testId="demo-cancel"
+          text "Cancel"
+      dialog id="remove" role="alertdialog" aria-label="Peel Off This Sticker?"
+        text "The beer and its photo are deleted. This can’t be undone."
+        button press=remove(aimed) destructive=true commandfor="remove" command="close" testId="remove-confirm"
+          text "Delete"
+        button commandfor="remove" command="close" testId="remove-cancel"
+          text "Cancel"
+      column flex=1 min-height=0 position="relative"
+        for t in nav.tabs key=t.name
+          column role="tabpanel" id=`panel-${t.name}` position="absolute" inset=0
+            for e in t.stack key=e.id
+              if e.name == "album"
+                column navigationKey=`${e.id}` navigationScroll="album" position="absolute" inset=0
+                  display="flex" flex-direction="column" background-color="paper" padding-top="env(safe-area-inset-top)"
+                  header display="flex" align-items="center" padding="8px 16px"
+                    text "Beer Book" role="heading" aria-level=1 flex=1
+                    button press=snap aria-label="Add a Beer" testId="add-beer"
+                      image "symbol:camera"
+                  canvas surface=brew(0.6, dark ? 1 : 0, still ? 1 : 0, 0) position="absolute" left=0 width="100%"
+                    bottom="calc(0px - 2 * env(safe-area-inset-bottom))" height="15rem" pointer-events="none" aria-hidden=true
+                  scroll id="album" flex=1 min-height=0 position="relative"
+                    Album(beers=shown, total=beers.length, loading=pending(beers), failed=failed(beers),
+                      styleFilter=styleFilter, order=order, filterStyle=filterStyle, sortBy=sortBy_, snap=snap, reload=reload)
+              if e.name == "beer"
+                column navigationKey=`${e.id}` navigationScroll=`beer-${e.id}` position="absolute" inset=0
+                  display="flex" flex-direction="column" background-color="paper" padding-top="env(safe-area-inset-top)"
+                  header display="flex" align-items="center" padding="8px 16px"
+                    text (found(beers, e.params.id) or pending(beers) ? nameOf(beers, e.params.id) : "Not Found")
+                      role="heading" aria-level=2 testId="detail-title"
+                  canvas surface=brew(0.6, dark ? 1 : 0, still ? 1 : 0, 0) position="absolute" left=0 width="100%"
+                    bottom="calc(0px - 2 * env(safe-area-inset-bottom))" height="15rem" pointer-events="none" aria-hidden=true
+                  scroll id=`beer-${e.id}` flex=1 min-height=0 position="relative"
+                    if found(beers, e.params.id) or pending(beers)
+                      for b in beers.filter(x => x.id == e.params.id) key=b.id
+                        BeerPage(beer=b, offset=time.utcOffset, rate=rate(b.id), askRemove=askRemove(b.id))
+                    else
+                      EmptyState(symbol="symbol:alert", title="No Such Sticker", message="It may have been peeled off.")
+                        button press=back buttonStyle="filled" testId="missing-back"
+                          text "Back to the Album"
+              if e.name == "add"
+                column navigationKey=`${e.id}` navigationPresentation="modal" navigationScroll="add-form" position="absolute" inset=0
+                  display="flex" flex-direction="column"
+                  header display="flex" align-items="center" justify-content="space-between" padding="8px 16px"
+                    button id="back" press=back aria-label="Cancel" testId="add-cancel"
+                      image "symbol:close"
+                    text "New Sticker" role="heading"
+                    button press=save buttonStyle="bordered-prominent" aria-label="Save" testId="add-save"
+                      disabled=(draftName.trim() == "" or draftPhoto == "" or pending(added) or pending(cut))
+                      image "symbol:checkmark"
+                  list id="add-form" appearance="auto" listStyle="inset-grouped" flex=1 min-height=0
+                    section
+                      row justify-content="center" padding-top=16 padding-bottom=8
+                        Sticker(photo=draftPhoto, cut=draftCut, name="", angle=-3, size="13rem", tid="add-preview")
+                      row justify-content="center"
+                        button press=snap testId="add-change-photo"
+                          text "Choose Another Photo"
+                    section
+                      row
+                        column flex=1 min-width=0 gap=4
+                          input value=draftName input=editName submit=save placeholder="Beer name" aria-label="Beer name"
+                            autocapitalize="words" aria-invalid=(refusal != "") testId="add-name"
+                          if refusal != ""
+                            text refusal font="-exact-footnote" color="-exact-system-red" testId="add-error"
+                      row
+                        input value=draftBrewery input=editBrewery placeholder="Brewery" aria-label="Brewery"
+                          autocapitalize="words" testId="add-brewery" flex=1 min-width=0
+                      footer
+                        text saveHint testId="add-hint"
+                    section
+                      row
+                        text "Style"
+                        select value=draftStyle change=editStyle aria-label="Style" testId="add-style"
+                          for s in styles() key=s
+                            option s value=s
+                      row
+                        row role="radiogroup" aria-label="Served in" flex=1
+                          for c in ["Glass", "Can", "Bottle"] key=c
+                            button role="radio" aria-checked=(draftContainer == c) press=editContainer(c) testId=`add-${c.toLowerCase()}` flex=1
+                              text c
+                      row
+                        text "Rating"
+                        StarPicker(value=draftRating, pick=editRating, tid="add-rating")
+                      row
+                        input value=draftLocation input=editLocation placeholder="Where (optional)" aria-label="Where"
+                          testId="add-location" flex=1 min-width=0
+              if e.name == "calendar"
+                column navigationKey=`${e.id}` navigationScroll="calendar" position="absolute" inset=0
+                  display="flex" flex-direction="column" background-color="paper" padding-top="env(safe-area-inset-top)"
+                  header display="flex" align-items="center" padding="8px 16px"
+                    text "Calendar" role="heading" aria-level=1 flex=1
+                  canvas surface=brew(0.6, dark ? 1 : 0, still ? 1 : 0, 0) position="absolute" left=0 width="100%"
+                    bottom="calc(0px - 2 * env(safe-area-inset-bottom))" height="15rem" pointer-events="none" aria-hidden=true
+                  scroll id="calendar" flex=1 min-height=0 position="relative"
+                    CalendarPage(month=month, loading=pending(month), still=still, shifted=(monthShift != 0),
+                      shift=shiftMonth, toToday=thisMonth, snap=snap, secret=askDemo)
+              if e.name == "day"
+                column navigationKey=`${e.id}` navigationScroll=`day-${e.id}` position="absolute" inset=0
+                  display="flex" flex-direction="column" background-color="paper" padding-top="env(safe-area-inset-top)"
+                  header display="flex" align-items="center" padding="8px 16px"
+                    text dayTitle(beers, e.params.id, time.utcOffset) role="heading" aria-level=2 testId="day-title"
+                  canvas surface=brew(0.6, dark ? 1 : 0, still ? 1 : 0, 0) position="absolute" left=0 width="100%"
+                    bottom="calc(0px - 2 * env(safe-area-inset-bottom))" height="15rem" pointer-events="none" aria-hidden=true
+                  scroll id=`day-${e.id}` flex=1 min-height=0 position="relative"
+                    DayPage(beers=beers.filter(b => b.day == e.params.id), loading=pending(beers), still=still)
+              if e.name == "year"
+                column navigationKey=`${e.id}` navigationScroll="year" position="absolute" inset=0
+                  display="flex" flex-direction="column" background-color="paper" padding-top="env(safe-area-inset-top)"
+                  header display="flex" align-items="center" padding="8px 16px"
+                    text "Year in Review" role="heading" aria-level=1 flex=1
+                  canvas surface=brew(0.6, dark ? 1 : 0, still ? 1 : 0, 0) position="absolute" left=0 width="100%"
+                    bottom="calc(0px - 2 * env(safe-area-inset-bottom))" height="15rem" pointer-events="none" aria-hidden=true
+                  scroll id="year" flex=1 min-height=0 position="relative"
+                    row justify-content="center" padding-top=12
+                      select value=`${year}` change=pickYear aria-label="Year" testId="year-pick"
+                        for y in yearChoices key=y
+                          option `${y}` value=`${y}`
+                    YearPage(review=review, loading=pending(review), still=still, dark=dark, snap=snap)
+      row role="tablist"
+        button role="tab" aria-controls="panel-album" aria-selected=(nav.tab == "album") press=pickTab("album")
+          testId="tab-album" flex=1
+          image "symbol:book"
+          text "Stickers"
+        button role="tab" aria-controls="panel-calendar" aria-selected=(nav.tab == "calendar") press=pickTab("calendar")
+          testId="tab-calendar" flex=1
+          image "symbol:calendar"
+          text "Calendar"
+        button role="tab" aria-controls="panel-year" aria-selected=(nav.tab == "year") press=pickTab("year")
+          testId="tab-year" flex=1
+          image "symbol:chart"
+          text "Year"
+
+// The album: its filter and order, then the stickers on the page, or why there are none.
+component Album
+  props
+    beers: Beer[]
+    total: number
+    loading: bool
+    failed: bool
+    styleFilter: string
+    order: string
+    filterStyle: action
+    sortBy: action
+    snap: action
+    reload: action
+  view
+    column padding="12px 16px 32px" gap=16 max-width="60rem" margin="0 auto" box-sizing="border-box" width="100%"
+      if failed
+        EmptyState(symbol="symbol:alert", title="Can’t Open the Album", message="Something went wrong reading it.")
+          button press=reload testId="retry"
+            text "Try Again"
+      else if total == 0 and not loading
+        EmptyState(symbol="symbol:camera", title="An Empty Album", message="Photograph your next beer and it becomes the first sticker.")
+          button press=snap buttonStyle="filled" testId="empty-add"
+            text "Add Your First Beer"
+      else
+        row gap=12 align-items="center" flex-wrap="wrap"
+          text countText(beers.length, "sticker", "stickers") color="ink.soft" flex=1 testId="album-count"
+          select value=styleFilter change=filterStyle aria-label="Style" max-width="100%" testId="filter-style"
+            option "All styles" value=""
+            for s in styles() key=s
+              option s value=s
+          select value=order change=sortBy aria-label="Order" max-width="100%" testId="order"
+            option "Newest first" value="newest"
+            option "Oldest first" value="oldest"
+            option "Top rated" value="best"
+        if beers.length == 0
+          text "No stickers in this style yet." color="ink.soft" text-align="center" padding=32 testId="album-none"
+        view display="grid" grid-template-columns="repeat(auto-fill, minmax(150px, 1fr))" gap="28px 20px"
+          padding-top=8 testId="album-grid"
+          for b, i in beers key=b.id
+            link href=path("beer", b.id) aria-label=b.name testId=`sticker-${b.id}`
+              display="flex" flex-direction="column" align-items="center" gap=8 color="ink"
+              Sticker(photo=b.photo, cut=b.sticker, name=b.name, angle=tilt(i), size="90%", tid=`sticker-photo-${b.id}`)
+              text b.name font-weight=600 text-align="center" max-width="100%" testId=`sticker-name-${b.id}`
+              if b.rating > 0
+                Stars(value=b.rating, tid=`sticker-stars-${b.id}`)
+
+// A sticker, a little tilted: the cut-out where there is one (its white edge and shadow are
+// in the PNG), else the photo inside a thick white rounded edge.
+component Sticker
+  props
+    photo: string
+    cut: string
+    name: string
+    angle: number
+    size: string
+    tid: string
+  view
+    if cut != ""
+      column width=size max-width="100%" aspect-ratio="1" min-height=0 display="flex" align-items="center"
+        justify-content="center" rotate=`${angle}deg` testId=tid
+        image cut alt=name flex=1 min-height=0 width="100%" object-fit="contain" testId=`${tid}-cut`
+    else
+      // `min-height=0` keeps the square: an aspect-ratio box otherwise grows to its photo.
+      // (Clipping would too, but AppKit then smears the shadow.)
+      column width=size max-width="100%" aspect-ratio="1" min-height=0 box-sizing="border-box" padding=7
+        background-color="sticker.edge" border-radius=26 box-shadow="0 6px 14px var(--shadow)"
+        rotate=`${angle}deg` display="flex" flex-direction="column" testId=tid
+        if photo != ""
+          image photo alt=name flex=1 min-height=0 min-width=0 width="100%" object-fit="cover" border-radius=20
+        else
+          column flex=1 border-radius=20 background-color="paper" align-items="center" justify-content="center"
+            image "symbol:camera" color="ink.soft"
+
+// Five stars, filled to the rating.
+component Stars
+  props
+    value: number
+    tid: string
+  view
+    row gap=2 role="img" aria-label=`Rated ${value} of 5` color="amber" testId=tid
+      for n in [1, 2, 3, 4, 5] key=n
+        image (n <= value ? "symbol:star-fill" : "symbol:star") font="-exact-caption1"
+
+// Five stars to press: a star sets the rating, the same star again clears it.
+component StarPicker
+  props
+    value: number
+    pick: action
+    tid: string
+  view
+    row role="radiogroup" aria-label="Rating" appearance="none" gap=4 testId=tid
+      for n in [1, 2, 3, 4, 5] key=n
+        button role="radio" aria-checked=(value == n) aria-label=countText(n, "star", "stars") press=pick(n)
+          appearance="none" color="amber" padding=2 testId=`${tid}-${n}`
+          image (n <= value ? "symbol:star-fill" : "symbol:star")
+
+// A sticker's own page: the sticker large, what you noted, and Delete.
+component BeerPage
+  props
+    beer: Beer
+    offset: number
+    rate: action
+    askRemove: action
+  view
+    column padding="24px 16px 40px" gap=24 align-items="center" max-width="34rem" margin="0 auto"
+      box-sizing="border-box" width="100%"
+      Sticker(photo=beer.photo, cut=beer.sticker, name=beer.name, angle=-2, size="280px", tid="detail-sticker")
+      column width="100%" box-sizing="border-box" padding="16px 20px" gap=12 border-radius=16
+        background-color="paper.card" color="ink"
+        dl display="grid" grid-template-columns="auto 1fr" gap="10px 16px" margin=0
+          dt color="ink.soft"
+            text "Brewery"
+          dd margin=0 testId="detail-brewery"
+            text (beer.brewery == "" ? "—" : beer.brewery)
+          dt color="ink.soft"
+            text "Style"
+          dd margin=0 testId="detail-style"
+            text beer.style
+          dt color="ink.soft"
+            text "Served in"
+          dd margin=0 testId="detail-container"
+            text beer.container
+          dt color="ink.soft"
+            text "Where"
+          dd margin=0 testId="detail-location"
+            text (beer.location == "" ? "—" : beer.location)
+          dt color="ink.soft"
+            text "When"
+          dd margin=0 testId="detail-when"
+            text formatDate(beer.drunkAt, offset, "medium")
+        row align-items="center" gap=12 padding-top=4
+          text "Rating" color="ink.soft" flex=1
+          StarPicker(value=beer.rating, pick=rate, tid="detail-rating")
+      button press=askRemove destructive=true buttonStyle="bordered" testId="delete-beer"
+        text "Peel Off Sticker"
+
+// The year as a scrapbook page: the count on a ticket, the months as bars, then
+// what you drank most, where, and your favourites.
+component YearPage
+  props
+    review: Review
+    loading: bool
+    still: bool
+    dark: bool
+    snap: action
+  view
+    column padding="16px 16px 40px" gap=22 max-width="40rem" margin="0 auto" box-sizing="border-box"
+      width="100%" color="ink"
+      if review.total == 0 and not loading
+        EmptyState(symbol="symbol:chart", title=`Nothing in ${review.year} Yet`, message="Each beer you add lands on this year’s page.")
+          button press=snap buttonStyle="filled" testId="year-add"
+            text "Add a Beer"
+      else
+        // The ticket: the year's count, with the beer poured in.
+        column align-items="center" gap=4 padding="22px 16px" border-radius=18 background-color="paper.card"
+          border="2px dashed var(--amber)" box-shadow="0 4px 12px var(--shadow)" position="relative"
+          testId="year-ticket"
+          // A canvas takes no corner radius of its own: this box rounds it, inside the dashed edge.
+          column position="absolute" inset=0 border-radius=16 overflow="hidden" pointer-events="none" aria-hidden=true
+            canvas surface=brew(0.38, dark ? 1 : 0, still ? 1 : 0, 1) width="100%" height="100%"
+          text `${review.year}` font="-exact-headline" color="ink.soft" position="relative"
+          text `${review.total}` font-size="4.5rem" font-weight=800 color="amber" font-variant-numeric="tabular-nums"
+            position="relative" testId="year-total"
+          text (review.total == 1 ? "beer" : "beers") font="-exact-title3" font-weight=700 position="relative"
+          text `on ${countText(review.days, "day", "days")}` color="ink.soft" position="relative" testId="year-days"
+        row gap=12 flex-wrap="wrap"
+          Fact(label="Average rating", value=(review.rated == 0 ? "—" : `${review.average} ★`), tid="year-average")
+          Fact(label="Busiest month", value=(review.busiest == "" ? "—" : review.busiest), tid="year-busiest")
+          Fact(label="First of the year", value=(review.first == "" ? "—" : review.first), tid="year-first")
+        Card(title="Month by month")
+          MonthBars(months=review.months)
+        if review.styles.length > 0
+          Card(title="What you drank")
+            Tallies(items=review.styles, tid="year-styles")
+        Card(title="Glass, can or bottle")
+          Tallies(items=review.containers, tid="year-containers")
+        if review.breweries.length > 0
+          Card(title="Top breweries")
+            Tallies(items=review.breweries, tid="year-breweries")
+        if review.places.length > 0
+          Card(title="Favourite places")
+            Tallies(items=review.places, tid="year-places")
+        if review.favourites.length > 0
+          column gap=14
+            text "Your favourites" role="heading" aria-level=2 font="-exact-title3" font-weight=700
+            row gap=18 justify-content="center" flex-wrap="wrap" padding-top=4 testId="year-favourites"
+              for b, i in review.favourites key=b.id
+                link href=path("beer", b.id) aria-label=b.name display="flex" flex-direction="column"
+                  align-items="center" gap=6 width="120px" color="ink" testId=`favourite-${b.id}`
+                  Sticker(photo=b.photo, cut=b.sticker, name=b.name, angle=tilt(i + 2), size="110px", tid=`favourite-photo-${b.id}`)
+                  text b.name font="-exact-footnote" font-weight=600 text-align="center" max-width="100%"
+                  Stars(value=b.rating, tid=`favourite-stars-${b.id}`)
+
+// A small fact.
+component Fact
+  props
+    label: string
+    value: string
+    tid: string
+  view
+    column flex="1 1 9rem" gap=4 padding="12px 14px" border-radius=14 background-color="paper.card"
+      box-shadow="0 2px 8px var(--shadow)"
+      text label font="-exact-footnote" color="ink.soft"
+      text value font="-exact-title3" font-weight=700 line-clamp=1 testId=tid
+
+// A scrapbook card with a heading.
+component Card
+  props
+    title: string
+  slot
+  view
+    column gap=12 padding="16px 18px" border-radius=16 background-color="paper.card"
+      box-shadow="0 2px 8px var(--shadow)"
+      text title role="heading" aria-level=2 font="-exact-headline"
+      children
+
+// Twelve bars, one a month, the tallest month full height.
+component MonthBars
+  props
+    months: MonthCount[]
+  view
+    row align-items="flex-end" gap=4 height="8.5rem" role="img"
+      aria-label=months.map(m => `${m.label} ${m.count}`).join(", ") testId="year-months"
+      for m in months key=m.month
+        column flex=1 min-width=0 height="100%" justify-content="flex-end" align-items="center" gap=4
+          if m.count > 0
+            text `${m.count}` font="-exact-caption2" color="ink.soft" font-variant-numeric="tabular-nums"
+          column width="100%" border-radius="6px 6px 2px 2px" background-color="amber"
+            height=`${m.count == 0 ? 2 : m.fraction * 78}%`
+            opacity=(m.count == 0 ? 0.25 : 1)
+          text m.label.slice(0, 1) font="-exact-caption2" color="ink.soft"
+
+// Counts as bars against the largest.
+component Tallies
+  props
+    items: Tally[]
+    tid: string
+  view
+    column gap=10 testId=tid
+      for t in items key=t.name
+        column gap=4
+          row
+            text t.name flex=1 min-width=0
+            text `${t.count}` color="ink.soft" font-variant-numeric="tabular-nums"
+          column height=8 border-radius=4 background-color="paper" overflow="hidden"
+            column height="100%" border-radius=4 background-color="amber"
+              width=`${t.fraction * 100}%`
+
+// The calendar: the month's name between its arrows, the weekdays, then a square a day.
+// A day you drank on shows its sticker over a little glass that fills with each beer.
+component CalendarPage
+  props
+    month: Month
+    loading: bool
+    still: bool
+    shifted: bool
+    shift: action
+    toToday: action
+    snap: action
+    // A long press on the month: the hidden demo mode.
+    secret: action
+  view
+    column padding="12px 12px 40px" gap=14 max-width="40rem" margin="0 auto" box-sizing="border-box"
+      width="100%" color="ink"
+      row align-items="center" gap=8
+        button press=shift(-1) aria-label="Previous Month" testId="cal-prev"
+          image "symbol:back"
+        column flex=1 min-width=0 align-items="center" gap=2
+          text month.label role="heading" aria-level=2 font-size="min(-exact-title2, 24px)" font-weight=800 text-align="center"
+            max-width="100%" contextmenu=secret testId="cal-month"
+          text (month.total == 0 ? "No beers" : `${countText(month.total, "beer", "beers")} on ${countText(month.days, "day", "days")}`)
+            font="-exact-footnote" color="ink.soft" text-align="center" testId="cal-summary"
+        button press=shift(1) aria-label="Next Month" testId="cal-next"
+          image "symbol:forward-chevron"
+      if shifted
+        button press=toToday buttonStyle="bordered" align-self="center" max-width="100%" testId="cal-today"
+          text "Back to This Month"
+      view display="grid" grid-template-columns="repeat(7, minmax(0, 1fr))" gap=6 aria-hidden=true
+        for d in weekdays() key=d
+          text d.slice(0, 1) font-size="min(-exact-caption1, 16px)" font-weight=700 color="ink.soft" text-align="center"
+      view display="grid" grid-template-columns="repeat(7, minmax(0, 1fr))" gap=6 testId="cal-grid"
+        for c, i in month.cells key=c.key
+          if c.date == 0
+            column aspect-ratio="1" min-height=0
+          else if c.count == 0
+            column aspect-ratio="1" min-height=0 border-radius=12 padding=5 box-sizing="border-box"
+              border=(c.today ? "2px solid var(--amber)" : c.future ? "1px dashed var(--shadow)" : "1px solid var(--shadow)")
+              aria-label=`${c.date}, nothing` testId=`day-${c.key}`
+              text `${c.date}` font-size="min(-exact-caption1, 15px)" color="ink.soft" font-variant-numeric="tabular-nums"
+          else
+            link href=path("day", c.key) aria-label=`${c.date}, ${c.name}${c.count > 1 ? ` and ${c.count - 1} more` : ""}`
+              aspect-ratio="1" min-height=0 border-radius=12 box-sizing="border-box" position="relative"
+              background-color="paper.card" box-shadow="0 2px 6px var(--shadow)" color="ink"
+              border=(c.today ? "2px solid var(--amber)" : "none")
+              animation=(still ? "none" : `pourIn 420ms ${(i % 7) * 40}ms cubic-bezier(.2,.8,.2,1) both`)
+              testId=`day-${c.key}`
+              Fizz(count=c.count, seed=i, still=still)
+              column position="absolute" inset=0 padding="10px 4px 3px" box-sizing="border-box" align-items="center" justify-content="center"
+                pointer-events="none"
+                MiniSticker(photo=c.photo, cut=c.sticker, name=c.name, angle=tilt(i))
+              text `${c.date}` position="absolute" top=4 left=6 font-size="min(-exact-caption2, 14px)" font-weight=800
+                font-variant-numeric="tabular-nums"
+              if c.count > 1
+                text `${c.count}` position="absolute" top=3 right=4 font-size="min(-exact-caption2, 14px)" font-weight=800
+                  color="paper.card" background-color="amber" border-radius=8 padding="0 5px" testId=`day-count-${c.key}`
+      if month.total == 0 and not loading
+        EmptyState(symbol="symbol:calendar", title="A Dry Month", message="Each beer you add lands on its day here.")
+          button press=snap buttonStyle="filled" testId="cal-add"
+            text "Add a Beer"
+
+// A day's beers, each sticker large, in the order you drank them.
+component DayPage
+  props
+    beers: Beer[]
+    loading: bool
+    still: bool
+  view
+    column padding="20px 16px 40px" gap=22 max-width="34rem" margin="0 auto" box-sizing="border-box"
+      width="100%" color="ink"
+      if beers.length == 0 and not loading
+        EmptyState(symbol="symbol:calendar", title="Nothing This Day", message="No beer was stuck on this day.")
+      else
+        text countText(beers.length, "beer", "beers") font="-exact-headline" color="ink.soft" text-align="center"
+          testId="day-count"
+        for b, i in sortBy(beers, x => x.drunkAt) key=b.id
+          link href=path("beer", b.id) aria-label=b.name display="flex" flex-direction="row" flex-wrap="wrap" align-items="center"
+            justify-content="center" gap=16
+            padding="14px 16px" border-radius=18 background-color="paper.card" box-shadow="0 2px 8px var(--shadow)"
+            color="ink" rotate=`${tilt(i) / 3}deg` animation=(still ? "none" : `pourIn 480ms ${i * 90}ms cubic-bezier(.2,.8,.2,1) both`)
+            testId=`day-beer-${b.id}`
+            Sticker(photo=b.photo, cut=b.sticker, name=b.name, angle=tilt(i + 1), size="7.5rem", tid=`day-sticker-${b.id}`)
+            column flex="1 1 12rem" min-width=0 gap=4
+              text b.name font="-exact-title3" font-weight=700
+              if b.brewery != ""
+                text b.brewery color="ink.soft"
+              text `${b.style} · ${b.container}` font="-exact-footnote" color="ink.soft"
+              if b.rating > 0
+                Stars(value=b.rating, tid=`day-stars-${b.id}`)
+
+// A day's sticker, small enough for a calendar square: the cut-out, else the photo in a white edge.
+component MiniSticker
+  props
+    photo: string
+    cut: string
+    name: string
+    angle: number
+  view
+    if cut != ""
+      image cut alt=name width="100%" height="100%" object-fit="contain" rotate=`${angle}deg`
+    else
+      column width="78%" aspect-ratio="1" min-height=0 box-sizing="border-box" padding=2 border-radius=8
+        background-color="sticker.edge" rotate=`${angle}deg` box-shadow="0 1px 3px var(--shadow)"
+        image photo alt=name flex=1 min-height=0 min-width=0 width="100%" object-fit="cover" border-radius=6
+
+// A calendar square's glass: amber to a level that rises with the day's count, and two
+// bubbles fizzing up through it.
+component Fizz
+  props
+    count: number
+    seed: number
+    still: bool
+  view
+    column position="absolute" inset=0 border-radius=12 overflow="hidden" pointer-events="none" aria-hidden=true
+      column position="absolute" left=0 right=0 bottom=0 height=`${count >= 4 ? 70 : 16 + count * 14}%`
+        background-color="amber" opacity=0.28
+        animation=(still ? "none" : `swell 2600ms ${seed * 130}ms ease-in-out infinite`)
+      for n in [0, 1] key=n
+        column position="absolute" bottom=2 left=`${((seed * 29 + n * 47) % 70) + 12}%` width=4 height=4 border-radius=4
+          border="1px solid var(--amber)" opacity=0
+          animation=(still ? "none" : `fizz ${1600 + ((seed + n) * 271) % 1200}ms ${((seed * 7 + n * 5) % 13) * 150}ms ease-in infinite both`)
+
+// The beer behind a page: a glass's worth of amber across its foot, two waves sloshing on
+// top at different speeds, and bubbles rising. It draws behind what follows it, takes no
+// touches, and holds still under Reduce Motion.
